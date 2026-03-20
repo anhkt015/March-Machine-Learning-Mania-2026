@@ -74,6 +74,7 @@ Simple models can perform competitively with good features
 
 Validation strategy significantly affects leaderboard performance
 
+This approach is inspired by the idea that recent performance is often more indicative in sports prediction, while historical data provides robustness. I created 5 submissions, but 4 of them had extra or missing rows because I wasn’t paying attention. As a result, those 4 files actually had better prediction rates, but they were not scored
 🔗 Links
 
 Kaggle Notebook: https://www.kaggle.com/code/hackertrip/b-ng-r-pro/edit
