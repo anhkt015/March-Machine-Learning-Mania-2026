@@ -1,0 +1,204 @@
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+
+# 1. Seeds
+mseeds = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MNCAATourneySeeds.csv")
+wseeds = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/WNCAATourneySeeds.csv")
+mseeds["Gender"] = "M"; wseeds["Gender"] = "W"
+all_seeds = pd.concat([mseeds, wseeds], ignore_index=True)
+all_seeds["SeedNum"] = all_seeds["Seed"].str[1:3].astype(int)
+
+# 2. Teams
+mteams = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MTeams.csv")
+wteams = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/WTeams.csv")
+mteams["Gender"] = "M"; wteams["Gender"] = "W"
+teams = pd.concat([mteams, wteams], ignore_index=True)
+
+team_season = all_seeds.merge(teams, on=["TeamID","Gender"], how="left")
+
+# 3. Regular Season → WinRate
+mregular = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MRegularSeasonCompactResults.csv")
+wregular = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/WRegularSeasonCompactResults.csv")
+
+def compute_winrate(df, gender):
+    wins = df.groupby(["Season","WTeamID"]).size()
+    losses = df.groupby(["Season","LTeamID"]).size()
+    winrate = (wins / (wins.add(losses, fill_value=0))).reset_index()
+    winrate.rename(columns={"WTeamID":"TeamID",0:"WinRate"}, inplace=True)
+    winrate["Gender"] = gender
+    return winrate
+
+m_winrate = compute_winrate(mregular,"M")
+w_winrate = compute_winrate(wregular,"W")
+winrate = pd.concat([m_winrate, w_winrate], ignore_index=True)
+
+team_season = team_season.merge(winrate, on=["Season","TeamID","Gender"], how="left")
+
+# 4. Massey Ordinals → Rank trung bình + cuối mùa
+massey = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MMasseyOrdinals.csv")
+massey_avg = massey.groupby(["Season","TeamID"])["OrdinalRank"].mean().reset_index().rename(columns={"OrdinalRank":"AvgRank"})
+massey_last = massey.groupby(["Season","TeamID"])["OrdinalRank"].last().reset_index().rename(columns={"OrdinalRank":"LastRank"})
+
+team_season = team_season.merge(massey_avg, on=["Season","TeamID"], how="left")
+team_season = team_season.merge(massey_last, on=["Season","TeamID"], how="left")
+
+# 5. Tournament Results
+mresults = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MNCAATourneyCompactResults.csv")
+wresults = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/WNCAATourneyCompactResults.csv")
+mresults["Gender"] = "M"; wresults["Gender"] = "W"
+results = pd.concat([mresults, wresults], ignore_index=True)
+
+# Chia train 2020–2024
+results_old = results[(results["Season"]>=2023)&(results["Season"]<=2024)]
+
+# Merge features cho matchups
+cols = ["Season","TeamID","Gender","SeedNum","WinRate","AvgRank","LastRank"]
+team_season_small = team_season[cols]
+
+matchups_old = results_old.merge(
+    team_season_small, left_on=["Season","WTeamID","Gender"], right_on=["Season","TeamID","Gender"], how="left"
+).rename(columns={"SeedNum":"SeedNum_W","WinRate":"WinRate_W","AvgRank":"Rank_W_avg","LastRank":"Rank_W_last"})
+
+matchups_old = matchups_old.merge(
+    team_season_small, left_on=["Season","LTeamID","Gender"], right_on=["Season","TeamID","Gender"], how="left"
+).rename(columns={"SeedNum":"SeedNum_L","WinRate":"WinRate_L","AvgRank":"Rank_L_avg","LastRank":"Rank_L_last"})
+
+# Features
+matchups_old["SeedDiff"] = matchups_old["SeedNum_W"] - matchups_old["SeedNum_L"]
+matchups_old["WinRateDiff"] = matchups_old["WinRate_W"] - matchups_old["WinRate_L"]
+matchups_old["RankDiff_avg"] = matchups_old["Rank_W_avg"] - matchups_old["Rank_L_avg"]
+matchups_old["RankDiff_last"] = matchups_old["Rank_W_last"] - matchups_old["Rank_L_last"]
+
+# Label
+pos = matchups_old[["Season","Gender","SeedDiff","WinRateDiff","RankDiff_avg","RankDiff_last"]].copy()
+pos["Label"] = 1
+neg = pos.copy()
+neg[["SeedDiff","WinRateDiff","RankDiff_avg","RankDiff_last"]] *= -1
+neg["Label"] = 0
+
+matchups_balanced_old = pd.concat([pos, neg], ignore_index=True)
+
+X_old = matchups_balanced_old[["SeedDiff","WinRateDiff","RankDiff_avg","RankDiff_last"]].fillna(0)
+y_old = matchups_balanced_old["Label"]
+
+model_21 = LogisticRegression(max_iter=1000)
+model_21.fit(X_old, y_old)
+joblib.dump(model_21 ,"/kaggle/working/model_23-24.pkl")
+print("Mô hình đã lưu tại /kaggle/working/model.pkl")
+import pandas as pd
+
+# Hàm tính WinRate theo mùa
+def compute_winrate(file, season_col="Season", wteam_col="WTeamID", lteam_col="LTeamID", season=2026):
+    games = pd.read_csv(file)
+    games_season = games[games[season_col] == season]
+    
+    wins = games_season.groupby(wteam_col).size().reset_index(name="Wins")
+    losses = games_season.groupby(lteam_col).size().reset_index(name="Losses")
+    
+    stats = pd.merge(wins, losses, left_on=wteam_col, right_on=lteam_col, how="outer").fillna(0)
+    stats["TeamID"] = stats[wteam_col].combine_first(stats[lteam_col])
+    stats["Wins"] = stats["Wins"].astype(int)
+    stats["Losses"] = stats["Losses"].astype(int)
+    stats["WinRate"] = stats["Wins"] / (stats["Wins"] + stats["Losses"])
+    
+    return stats[["TeamID","Wins","Losses","WinRate"]]
+
+# 1. Đọc sample submission
+sample = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/SampleSubmissionStage2.csv")
+sample_split = sample["ID"].str.split("_", expand=True)
+sample["Season"] = sample_split[0].astype(int)
+sample["Team1"] = sample_split[1].astype(int)
+sample["Team2"] = sample_split[2].astype(int)
+
+# 2. Seeds (2025 vì file chỉ có tới đó)
+seeds = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MNCAATourneySeeds.csv")
+seeds_2026 = seeds[seeds["Season"] == 2025].copy()
+seeds_2026["SeedNum"] = seeds_2026["Seed"].str.extract(r"(\d+)").astype(int)
+
+# 3. WinRate cho mùa 2026
+team_season_m = compute_winrate("/kaggle/input/competitions/march-machine-learning-mania-2026/MRegularSeasonCompactResults.csv")
+team_season_w = compute_winrate("/kaggle/input/competitions/march-machine-learning-mania-2026/WRegularSeasonCompactResults.csv")
+team_season_all = pd.concat([team_season_m, team_season_w], ignore_index=True)
+
+# 4. Massey Ordinals → Rank trung bình + cuối mùa
+massey = pd.read_csv("/kaggle/input/competitions/march-machine-learning-mania-2026/MMasseyOrdinals.csv")
+massey_avg = massey.groupby(["Season","TeamID"])["OrdinalRank"].mean().reset_index().rename(columns={"OrdinalRank":"AvgRank"})
+massey_last = massey.groupby(["Season","TeamID"])["OrdinalRank"].last().reset_index().rename(columns={"OrdinalRank":"LastRank"})
+
+team_season_all = team_season_all.merge(massey_avg, on="TeamID", how="left")
+team_season_all = team_season_all.merge(massey_last, on="TeamID", how="left")
+
+# 5. Merge cho Team1
+sample = sample.merge(seeds_2026[["TeamID","SeedNum"]].rename(columns={"TeamID":"Team1","SeedNum":"SeedNum_T1"}),
+                      on="Team1", how="left")
+sample = sample.merge(team_season_all.rename(columns={"TeamID":"Team1","WinRate":"WinRate_T1",
+                                                      "AvgRank":"Rank_T1_avg","LastRank":"Rank_T1_last"}),
+                      on="Team1", how="left")
+
+# 6. Merge cho Team2
+sample = sample.merge(seeds_2026[["TeamID","SeedNum"]].rename(columns={"TeamID":"Team2","SeedNum":"SeedNum_T2"}),
+                      on="Team2", how="left")
+sample = sample.merge(team_season_all.rename(columns={"TeamID":"Team2","WinRate":"WinRate_T2",
+                                                      "AvgRank":"Rank_T2_avg","LastRank":"Rank_T2_last"}),
+                      on="Team2", how="left")
+
+# 7. Tạo features
+sample["SeedDiff"] = sample["SeedNum_T1"] - sample["SeedNum_T2"]
+sample["WinRateDiff"] = sample["WinRate_T1"] - sample["WinRate_T2"]
+sample["RankDiff_avg"] = sample["Rank_T1_avg"] - sample["Rank_T2_avg"]
+sample["RankDiff_last"] = sample["Rank_T1_last"] - sample["Rank_T2_last"]
+
+# 8. X_test cho model
+X_test = sample[["SeedDiff","WinRateDiff","RankDiff_avg","RankDiff_last"]].fillna(0)
+import joblib
+import xgboost as xgb
+
+# Load Logistic Regression model (ví dụ 2023–2024)
+model_2324 = joblib.load("/kaggle/input/datasets/hackertrip/23-24111/model_23-24.pkl")
+
+# Load Logistic Regression model (old 2021–2024)
+model_old = joblib.load("/kaggle/input/datasets/hackertrip/olaaaaaa/model_old.pkl")
+
+# Nếu bạn có XGBoost model_new (2025) thì load tương tự:
+# model_new = joblib.load("model_new.pkl")  # nếu đã dump bằng joblib
+# hoặc nếu dùng xgb.train thì phải save bằng model_new.save_model("model_new.json")
+# rồi load lại bằng xgb.Booster:
+# model_new = xgb.Booster()
+# model_new.load_model("model_new.json")
+
+# Dự đoán với Logistic Regression
+proba_2324 = model_2324.predict_proba(X_test)[:,1]
+proba_old   = model_old.predict_proba(X_test)[:,1]
+
+# Nếu có XGBoost model_new
+# proba_new = model_new.predict(xgb.DMatrix(X_test))
+
+# Kết hợp (ensemble)
+alpha, beta = 0.6, 0.4
+# ví dụ kết hợp model_old và model_new
+# final_proba = alpha*proba_old + beta*proba_new
+
+# Nếu chỉ muốn dùng model_2324
+final_proba = proba_2324
+
+# Gắn vào sample để tạo submission
+sample["Pred"] = final_proba
+sample[["ID","Pred"]].to_csv("submission.csv", index=False)
+import joblib
+
+# Load Logistic Regression models
+model_2324 = joblib.load("/kaggle/input/datasets/hackertrip/23-24111/model_23-24.pkl")
+model_old   = joblib.load("/kaggle/input/datasets/hackertrip/olaaaaaa/model_old.pkl")
+
+# Dự đoán
+proba_2324 = model_2324.predict_proba(X_test)[:,1]
+proba_old   = model_old.predict_proba(X_test)[:,1]
+
+# Ensemble
+final_proba = 0.5 * proba_2324 + 0.5 *proba_old
+
+# Xuất submission
+sample["Pred"] = final_proba
+sample[["ID","Pred"]].to_csv("submission2026.csv", index=False)
+
